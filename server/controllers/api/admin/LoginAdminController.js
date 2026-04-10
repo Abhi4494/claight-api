@@ -11,6 +11,9 @@ const refreshCookieOptions = {
     secure: false,
 };
 
+// Cache to prevent race conditions when multiple requests try to refresh simultaneously
+const refreshInProgress = new Map(); // key: refreshToken, value: Promise<result>
+
 const login = async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -586,49 +589,78 @@ const verifyToken = async (req, res) => {
     }
 };
 
-// Helper: try to refresh using refresh_token cookie
+// Helper: try to refresh using refresh_token cookie (with race condition protection)
 const tryRefreshAccessToken = async (req, res) => {
-    try {
-        const refreshToken = req.cookies?.refresh_token;
-        if (!refreshToken) return null;
+    const refreshToken = req.cookies?.refresh_token;
+    if (!refreshToken) return null;
 
-        let decoded;
+    // If a refresh is already in progress for this token, wait for it
+    if (refreshInProgress.has(refreshToken)) {
+        const result = await refreshInProgress.get(refreshToken);
+        if (result) {
+            res.cookie("access_token", result.accessToken, {
+                ...refreshCookieOptions,
+                maxAge: 15 * 60 * 1000,
+            });
+            res.cookie("refresh_token", result.newRefreshToken, {
+                ...refreshCookieOptions,
+                maxAge: 7 * 24 * 60 * 60 * 1000,
+            });
+        }
+        return result ? { accessToken: result.accessToken } : null;
+    }
+
+    // Start the refresh and store the promise so concurrent requests can wait
+    const refreshPromise = (async () => {
         try {
-            decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+            let decoded;
+            try {
+                decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+            } catch {
+                return null;
+            }
+
+            const user = await SuperAdmin.findOne({
+                where: { id: decoded.id },
+                include: [{ model: AdminRole, as: "admin_role", attributes: ["id", "name"] }],
+            });
+
+            if (!user || user.refresh_token !== refreshToken) return null;
+
+            const role_id = user.role_id ? user.role_id : 0;
+            const userData = { id: user.id, role_id, role_type: user.admin_role.name };
+
+            const newAccessToken = jwt.sign(userData, process.env.JWT_ACCESS_SECRET, { expiresIn: "15m" });
+            const newRefreshToken = jwt.sign(userData, process.env.JWT_REFRESH_SECRET, { expiresIn: "7d" });
+
+            await user.update({ refresh_token: newRefreshToken });
+
+            return { accessToken: newAccessToken, newRefreshToken };
         } catch {
             return null;
         }
+    })();
 
-        const user = await SuperAdmin.findOne({
-            where: { id: decoded.id },
-            include: [{ model: AdminRole, as: "admin_role", attributes: ["id", "name"] }],
-        });
+    refreshInProgress.set(refreshToken, refreshPromise);
 
-        if (!user || user.refresh_token !== refreshToken) return null;
+    const result = await refreshPromise;
 
-        const role_id = user.role_id ? user.role_id : 0;
-        const userData = { id: user.id, role_id, role_type: user.admin_role.name };
+    // Clean up after a short delay to handle closely-timed requests
+    setTimeout(() => refreshInProgress.delete(refreshToken), 5000);
 
-        const newAccessToken = jwt.sign(userData, process.env.JWT_ACCESS_SECRET, { expiresIn: "15m" });
-        const newRefreshToken = jwt.sign(userData, process.env.JWT_REFRESH_SECRET, { expiresIn: "7d" });
-
-        await user.update({ refresh_token: newRefreshToken });
-
-        // Set new cookies
-        res.cookie("access_token", newAccessToken, {
+    if (result) {
+        res.cookie("access_token", result.accessToken, {
             ...refreshCookieOptions,
             maxAge: 15 * 60 * 1000,
         });
-
-        res.cookie("refresh_token", newRefreshToken, {
+        res.cookie("refresh_token", result.newRefreshToken, {
             ...refreshCookieOptions,
             maxAge: 7 * 24 * 60 * 60 * 1000,
         });
-
-        return { accessToken: newAccessToken };
-    } catch {
-        return null;
+        return { accessToken: result.accessToken };
     }
+
+    return null;
 };
 
 const logout = async (req, res) => {

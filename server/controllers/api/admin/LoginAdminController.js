@@ -511,26 +511,40 @@ const changePassword = async (req, res) => {
 
 const verifyToken = async (req, res) => {
     try {
-        const token = req.cookies?.access_token;
-        console.log(token,'token')
+        let token = req.cookies?.access_token;
+        let newAccessToken = null;
 
+        // If access token is missing or expired, try refresh token
         if (!token) {
-            return res.status(401).json({ statusCode: 401, message: "Access token not found" });
+            const refreshTokenResult = await tryRefreshAccessToken(req, res);
+            if (!refreshTokenResult) {
+                return res.status(401).json({ statusCode: 401, message: "Access token not found. Please login again." });
+            }
+            token = refreshTokenResult.accessToken;
+            newAccessToken = refreshTokenResult.accessToken;
         }
 
         let decoded;
         try {
             decoded = jwt.verify(token, process.env.JWT_ACCESS_SECRET);
         } catch (err) {
-            return res.status(401).json({
-                statusCode: 401,
-                message: err.name === "TokenExpiredError" ? "Token has expired" : "Invalid token",
-            });
+            if (err.name === "TokenExpiredError") {
+                // Access token expired, try refresh token
+                const refreshTokenResult = await tryRefreshAccessToken(req, res);
+                if (!refreshTokenResult) {
+                    return res.status(401).json({ statusCode: 401, message: "Token has expired. Please login again." });
+                }
+                token = refreshTokenResult.accessToken;
+                newAccessToken = refreshTokenResult.accessToken;
+                decoded = jwt.verify(token, process.env.JWT_ACCESS_SECRET);
+            } else {
+                return res.status(401).json({ statusCode: 401, message: "Invalid token" });
+            }
         }
 
         const user = await SuperAdmin.findOne({
             where: { id: decoded.id, is_deleted: 0 },
-            attributes: ["id", "first_name", "last_name", "email"],
+            attributes: ["id", "first_name", "last_name", "email", "is_active"],
             include: [
                 {
                     model: AdminRole,
@@ -548,7 +562,7 @@ const verifyToken = async (req, res) => {
             return res.status(401).json({ statusCode: 401, message: "Account is inactive" });
         }
 
-        return res.status(200).json({
+        const response = {
             statusCode: 200,
             message: "Token is valid",
             data: {
@@ -559,9 +573,61 @@ const verifyToken = async (req, res) => {
                 role_id: user.admin_role?.id,
                 role_name: user.admin_role?.name,
             },
-        });
+        };
+
+        // Include new access token if it was refreshed
+        if (newAccessToken) {
+            response.token = newAccessToken;
+        }
+
+        return res.status(200).json(response);
     } catch (error) {
         return res.status(500).json({ statusCode: 500, message: error.message });
+    }
+};
+
+// Helper: try to refresh using refresh_token cookie
+const tryRefreshAccessToken = async (req, res) => {
+    try {
+        const refreshToken = req.cookies?.refresh_token;
+        if (!refreshToken) return null;
+
+        let decoded;
+        try {
+            decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+        } catch {
+            return null;
+        }
+
+        const user = await SuperAdmin.findOne({
+            where: { id: decoded.id },
+            include: [{ model: AdminRole, as: "admin_role", attributes: ["id", "name"] }],
+        });
+
+        if (!user || user.refresh_token !== refreshToken) return null;
+
+        const role_id = user.role_id ? user.role_id : 0;
+        const userData = { id: user.id, role_id, role_type: user.admin_role.name };
+
+        const newAccessToken = jwt.sign(userData, process.env.JWT_ACCESS_SECRET, { expiresIn: "15m" });
+        const newRefreshToken = jwt.sign(userData, process.env.JWT_REFRESH_SECRET, { expiresIn: "7d" });
+
+        await user.update({ refresh_token: newRefreshToken });
+
+        // Set new cookies
+        res.cookie("access_token", newAccessToken, {
+            ...refreshCookieOptions,
+            maxAge: 15 * 60 * 1000,
+        });
+
+        res.cookie("refresh_token", newRefreshToken, {
+            ...refreshCookieOptions,
+            maxAge: 7 * 24 * 60 * 60 * 1000,
+        });
+
+        return { accessToken: newAccessToken };
+    } catch {
+        return null;
     }
 };
 

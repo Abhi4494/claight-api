@@ -87,7 +87,7 @@ app.use("/api/v1", APIRouter);
 APIRouter.use("/admin",routers.superAdminRoute)
 
 
-app.get("/api/v1/checkstatus", (req, res) => {
+app.get("/api/v1/checkstatus-new", (req, res) => {
   try {
     res.status(200).json({ statusCode: 200, message: "API is running!" });
   } catch (error) {
